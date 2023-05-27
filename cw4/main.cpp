@@ -55,7 +55,7 @@ namespace
 		ShaderPath defaultShaderPath{ SHADERDIR_ "default.vert.spv" , SHADERDIR_ "default.frag.spv" };
 		ShaderPath alphamaskShaderPath{ SHADERDIR_ "default.vert.spv", SHADERDIR_ "alphamasking.frag.spv" };
 
-		//ShaderPath lightingShaderPath{ SHADERDIR_ "lighting.vert.spv", SHADERDIR_ "lighting.frag.spv" };
+		ShaderPath shadowShaderPath{ SHADERDIR_ "shadowmap.vert.spv", SHADERDIR_ "shadowmap.frag.spv" };
 
 #		undef SHADERDIR_
 
@@ -66,8 +66,10 @@ namespace
 	// resolution but will also limit the view distance.
 		constexpr float kCameraNear = 0.1f;
 		constexpr float kCameraFar = 100.f;
-
 		constexpr auto kCameraFov = 60.0_degf;
+
+		constexpr float kShadowMapHeight = 1024;
+		constexpr float kShadowMapWidth = 1024;
 
 		constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
@@ -164,6 +166,14 @@ namespace
 		VkSemaphore,
 		VkSemaphore
 	);
+
+	/////////////////////////////////////
+	lut::RenderPass create_shadowmap_render_pass(lut::VulkanWindow const& aWindow);
+	lut::DescriptorSetLayout create_shadowScene_descriptor_layout(lut::VulkanWindow const&);
+	lut::Pipeline create_shadow_pipeline(lut::VulkanWindow const&, VkRenderPass, VkPipelineLayout, ShaderPath);
+	std::tuple<lut::Image, lut::ImageView> create_shadow_buffer(lut::VulkanWindow const& aWindow, lut::Allocator const& aAllocator);
+	void create_shadowpass_framebuffers(lut::VulkanWindow const& aWindow, VkRenderPass aRenderPass,
+		lut::Framebuffer& aFramebuffers, VkImageView aDepthView);
 }
 
 int main() try
@@ -183,6 +193,32 @@ int main() try
 	// Create VMA allocator
 	lut::Allocator allocator = lut::create_allocator(window);
 
+	///////////////////////////////////////////////////////////////////////////////////
+	// SHADOW PASS
+	//Creaing resourses for rendering
+	lut::RenderPass shadowPass = create_shadowmap_render_pass(window);
+
+	//create scene descriptor set layout
+	lut::DescriptorSetLayout shadowDesLayout = create_shadowScene_descriptor_layout(window);
+
+	lut::PipelineLayout shadowPipeLayout = create_pipeline_layout(window, std::vector< VkDescriptorSetLayout> {shadowDesLayout.handle});
+	lut::Pipeline shadowPipe = create_shadow_pipeline(window, shadowPass.handle, shadowPipeLayout.handle, cfg::shadowShaderPath);
+
+	auto [shadowMapImage, shadowMapView] = create_shadow_buffer(window, allocator);
+	lut::Framebuffer shadowBuffer;
+
+	create_shadowpass_framebuffers(window, shadowPass.handle, shadowBuffer, shadowMapView.handle);
+
+	lut::CommandPool cpool = lut::create_command_pool(window, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+
+	VkCommandBuffer scbuffer = lut::alloc_command_buffer(window, cpool.handle);
+	lut::Fence shadowPassFence = lut::create_fence(window, VK_FENCE_CREATE_SIGNALED_BIT);
+
+
+	//lut::Semaphore imageAvailable = lut::create_semaphore(window);
+	//lut::Semaphore renderFinished = lut::create_semaphore(window);
+
+	//////////////////////////////////////////////////////////////////////////////////////
 	//Creaing resourses for rendering
 	lut::RenderPass renderPass = create_render_pass(window);
 
@@ -203,7 +239,7 @@ int main() try
 	std::vector<lut::Framebuffer> framebuffers;
 	create_swapchain_framebuffers(window, renderPass.handle, framebuffers, depthBufferView.handle);
 
-	lut::CommandPool cpool = lut::create_command_pool(window, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+	//lut::CommandPool cpool = lut::create_command_pool(window, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
 
 	std::vector<VkCommandBuffer> cbuffers;
 	std::vector<lut::Fence> cbfences;
@@ -1410,6 +1446,461 @@ namespace
 
 }
 
+namespace 
+{
+	lut::RenderPass create_shadowmap_render_pass(lut::VulkanWindow const& aWindow)
+	{
+		//ATTACHMENT
+		//framebuffer
+		VkAttachmentDescription attachments[1]{};
+		//depthbuffer
+		attachments[0].format = cfg::kDepthFormat;
+		attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+		//SUBPASS
+		VkAttachmentReference depthAttachment{};
+		depthAttachment.attachment = 0; 
+		depthAttachment.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+		VkSubpassDescription subpasses[1]{};
+		subpasses[0].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpasses[0].colorAttachmentCount = 0;
+		subpasses[0].pColorAttachments = nullptr;
+		subpasses[0].pDepthStencilAttachment = &depthAttachment;
+
+		//no explicit subpass dependencies 
+
+		VkRenderPassCreateInfo passInfo{};
+		passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		passInfo.attachmentCount = 1;
+		passInfo.pAttachments = attachments;
+		passInfo.subpassCount = 1;
+		passInfo.pSubpasses = subpasses;
+		passInfo.dependencyCount = 0; //changed!
+		passInfo.pDependencies = nullptr; //changed! 
+
+		VkRenderPass rpass = VK_NULL_HANDLE;
+		if (auto const res = vkCreateRenderPass(aWindow.device, &passInfo, nullptr, &rpass); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to create render pass\n"
+				"vkCreateRenderPass() returned %s", lut::to_string(res).c_str());
+		}
+
+		return lut::RenderPass(aWindow.device, rpass);
+	}
+
+	lut::DescriptorSetLayout create_shadowScene_descriptor_layout(lut::VulkanWindow const& aWindow)
+	{
+		VkDescriptorSetLayoutBinding bindings[1]{};
+		bindings[0].binding = 0; // number must match the index of the corresponding 
+		bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		bindings[0].descriptorCount = 1;
+		bindings[0].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+
+		VkDescriptorSetLayoutCreateInfo layoutInfo{};
+		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		layoutInfo.bindingCount = sizeof(bindings) / sizeof(bindings[0]);
+		layoutInfo.pBindings = bindings;
+
+		VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+		if (auto const res = vkCreateDescriptorSetLayout(aWindow.device, &layoutInfo, nullptr, &layout); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to create descriptor set layout\n"
+				"vkCreateDescriptorSetLayout() returned %s", lut::to_string(res).c_str());
+
+		}
+		return lut::DescriptorSetLayout(aWindow.device, layout);
+	}
+
+	lut::Pipeline create_shadow_pipeline(lut::VulkanWindow const& aWindow, VkRenderPass aRenderPass, VkPipelineLayout aPipelineLayout, ShaderPath aShaderPath)
+	{
+		//throw lut::Error("Not yet implemented"); //TODO: implement me!
+		lut::ShaderModule vert = lut::load_shader_module(aWindow, aShaderPath.kVertShaderPath);
+		lut::ShaderModule frag = lut::load_shader_module(aWindow, aShaderPath.kFragShaderPath);
+		                    
+		// Define shader stages in the pipeline 
+		VkPipelineShaderStageCreateInfo stages[2]{};
+		stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+		stages[0].module = vert.handle;
+		stages[0].pName = "main";
+
+		stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		stages[1].module = frag.handle;
+		stages[1].pName = "main";
+
+		/// //////////////////////
+
+		VkVertexInputBindingDescription vertexInputs[1]{};
+		//position buffer
+		vertexInputs[0].binding = 0;
+		vertexInputs[0].stride = sizeof(glm::vec3);
+		vertexInputs[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+		VkVertexInputAttributeDescription vertexAttributes[1]{};
+		vertexAttributes[0].binding = 0; // must match binding above
+		vertexAttributes[0].location = 0; // must match shader 
+		vertexAttributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+		vertexAttributes[0].offset = 0;
+
+		VkPipelineVertexInputStateCreateInfo inputInfo{};
+		inputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+		inputInfo.vertexBindingDescriptionCount = 1; // number of vertexInputs above 
+		inputInfo.pVertexBindingDescriptions = vertexInputs;
+		inputInfo.vertexAttributeDescriptionCount = 1; // number of vertexAttributes above 
+		inputInfo.pVertexAttributeDescriptions = vertexAttributes;
+
+
+		// Define which primitive (point, line, triangle, ...) the input is 
+		// assembled into for rasterization. 
+		VkPipelineInputAssemblyStateCreateInfo assemblyInfo{};
+		assemblyInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+		assemblyInfo.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		assemblyInfo.primitiveRestartEnable = VK_FALSE;
+
+		// Define viewport and scissor regions 
+		VkViewport viewport{};
+		viewport.x = 0.f;
+		viewport.y = 0.f;
+		viewport.width = aWindow.swapchainExtent.width;
+		viewport.height = aWindow.swapchainExtent.height;
+		viewport.minDepth = 0.f;
+		viewport.maxDepth = 1.f;
+
+		VkRect2D scissor{};
+		scissor.offset = VkOffset2D{ 0, 0 };
+		scissor.extent = VkExtent2D{ aWindow.swapchainExtent.width, aWindow.swapchainExtent.height };
+
+		VkPipelineViewportStateCreateInfo viewportInfo{};
+		viewportInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+		viewportInfo.viewportCount = 1;
+		viewportInfo.pViewports = &viewport;
+		viewportInfo.scissorCount = 1;
+		viewportInfo.pScissors = &scissor;
+
+		// Define rasterization options 
+		VkPipelineRasterizationStateCreateInfo rasterInfo{};
+		rasterInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+		rasterInfo.depthClampEnable = VK_FALSE;
+		rasterInfo.rasterizerDiscardEnable = VK_FALSE;
+		rasterInfo.polygonMode = VK_POLYGON_MODE_FILL;
+		rasterInfo.cullMode = VK_CULL_MODE_BACK_BIT;
+		rasterInfo.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+		rasterInfo.depthBiasEnable = VK_FALSE;
+		rasterInfo.lineWidth = 1.f; // required.
+
+		// Define multisampling state 
+		VkPipelineMultisampleStateCreateInfo samplingInfo{};
+		samplingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+		samplingInfo.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+		VkPipelineDepthStencilStateCreateInfo depthInfo{};
+		depthInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+		depthInfo.depthTestEnable = VK_TRUE;
+		depthInfo.depthWriteEnable = VK_TRUE;
+		depthInfo.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+		depthInfo.minDepthBounds = 0.f;
+		depthInfo.maxDepthBounds = 1.f;
+
+		// Create pipeline 
+		VkGraphicsPipelineCreateInfo pipeInfo{};
+		pipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+
+		pipeInfo.stageCount = 2; // vertex + fragment stages 
+		pipeInfo.pStages = stages;
+
+		pipeInfo.pVertexInputState = &inputInfo;
+		pipeInfo.pInputAssemblyState = &assemblyInfo;
+		pipeInfo.pTessellationState = nullptr; // no tessellation 
+		pipeInfo.pViewportState = &viewportInfo;
+		pipeInfo.pRasterizationState = &rasterInfo;
+		pipeInfo.pMultisampleState = &samplingInfo;
+		pipeInfo.pDepthStencilState = &depthInfo;
+		pipeInfo.pColorBlendState = nullptr;
+		pipeInfo.pDynamicState = nullptr; // no dynamic states 
+
+		pipeInfo.layout = aPipelineLayout;
+		pipeInfo.renderPass = aRenderPass;
+		pipeInfo.subpass = 0; // first subpass of aRenderPass 
+
+		VkPipeline pipe = VK_NULL_HANDLE;
+		if (auto const res = vkCreateGraphicsPipelines(aWindow.device, VK_NULL_HANDLE, 1,
+			&pipeInfo, nullptr, &pipe); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to create graphics pipeline\n"
+				"vkCreateGraphicsPipelines() returned %s", lut::to_string(res).c_str());
+		}
+
+		return lut::Pipeline(aWindow.device, pipe);
+	}
+
+	std::tuple<lut::Image, lut::ImageView> create_shadow_buffer(lut::VulkanWindow const& aWindow, lut::Allocator const& aAllocator)
+	{
+		//throw lut::Error("Not yet implemented"); //TODO- (Section 6) implement me!
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = cfg::kDepthFormat;
+		imageInfo.extent.width = cfg::kShadowMapWidth;
+		imageInfo.extent.height = cfg::kShadowMapHeight;
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+		VkImage image = VK_NULL_HANDLE;
+		VmaAllocation allocation = VK_NULL_HANDLE;
+
+		if (auto const res = vmaCreateImage(aAllocator.allocator, &imageInfo, &allocInfo,
+			&image, &allocation, nullptr); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to allocate depth buffer image.\n"
+				"vmaCreateImage() returned %s", lut::to_string(res).c_str());
+		}
+
+		lut::Image depthImage(aAllocator.allocator, image, allocation);
+
+		// Create the image view 
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = depthImage.image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = cfg::kDepthFormat;
+		viewInfo.components = VkComponentMapping{};
+		viewInfo.subresourceRange = VkImageSubresourceRange{
+		VK_IMAGE_ASPECT_DEPTH_BIT,
+		0, 1,
+		0, 1
+		};
+
+		VkImageView view = VK_NULL_HANDLE;
+		if (auto const res = vkCreateImageView(aWindow.device, &viewInfo, nullptr, &view); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to create image view\n"
+				"vkCreateImageView() returned %s", lut::to_string(res).c_str());
+		}
+
+		return{ std::move(depthImage), lut::ImageView(aWindow.device, view) };
+	}
+
+
+	void record_and_submit_shadow_commands(VkCommandBuffer aCmdBuff, VkRenderPass aRenderPass, VkFramebuffer aFramebuffer, VkPipelineLayout aDefaultPipeLayout,
+		VkPipeline aDefaultPipe, VkPipelineLayout aAlphamaskPipeLayout, VkPipeline aAlphamaskPipe, VkExtent2D const& aImageExtent,
+		std::vector<SceneMesh> const& sceneMeshes, VkBuffer aSceneUBO,
+		glsl::SceneUniform const& aSceneUniform, VkDescriptorSet aSceneDescriptors,
+		std::vector <VkDescriptorSet> aTexDescriptors, BakedModel* aModel, std::unordered_map <unsigned int, std::unordered_map <unsigned int, std::vector<unsigned int>>> aMaterialMeshesMap
+	, lut::VulkanContext const& aWindow,
+		VkFence aFence)
+	{
+		//throw lut::Error("Not yet implemented"); //TODO: implement me!
+		// Begin recording commands 
+		VkCommandBufferBeginInfo begInfo{};
+		begInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		begInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		begInfo.pInheritanceInfo = nullptr;
+
+		if (auto const res = vkBeginCommandBuffer(aCmdBuff, &begInfo); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to begin recording command buffer\n"
+				"vkBeginCommandBuffer() returned %s", lut::to_string(res).c_str());
+		}
+
+		// Upload scene uniforms 
+		lut::buffer_barrier(aCmdBuff,
+			aSceneUBO,
+			VK_ACCESS_UNIFORM_READ_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT,
+			VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT
+		);
+
+		vkCmdUpdateBuffer(aCmdBuff, aSceneUBO, 0, sizeof(glsl::SceneUniform), &aSceneUniform);
+		lut::buffer_barrier(aCmdBuff,
+			aSceneUBO,
+			VK_ACCESS_TRANSFER_WRITE_BIT,
+			VK_ACCESS_UNIFORM_READ_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+		);
+
+		// Clear values
+		VkClearValue clearValues[1]{};
+		clearValues[0].depthStencil.depth = 1.f;
+
+		// Begin render pass 
+		VkRenderPassBeginInfo passInfo{};
+		passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		passInfo.renderPass = aRenderPass;
+		passInfo.framebuffer = aFramebuffer;
+		passInfo.renderArea.offset = VkOffset2D{ 0, 0 };
+		passInfo.renderArea.extent = VkExtent2D{ aImageExtent.width, aImageExtent.height };
+		passInfo.clearValueCount = 1;
+		passInfo.pClearValues = clearValues;
+
+		vkCmdBeginRenderPass(aCmdBuff, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+
+		// Begin drawing with graphics pipeline 
+		// Bind Default pipeline 
+		vkCmdBindPipeline(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aDefaultPipe);
+		vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aDefaultPipeLayout,
+			0, 1, &aSceneDescriptors, 0, nullptr);
+
+		for (auto& mat : aMaterialMeshesMap[0])
+		{
+			// Bind Material descriptors
+			vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aDefaultPipeLayout,
+				1, 1, &aTexDescriptors[mat.first], 0, nullptr);
+
+			for (unsigned int i = 0; i < aMaterialMeshesMap[0][mat.first].size(); i++)
+			{
+				// Bind vertex input 
+				VkBuffer vBuffers[3] = { sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].positions.buffer,
+										sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].normals.buffer,
+										sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].texcoords.buffer };
+				VkDeviceSize offsets[3]{};
+				vkCmdBindVertexBuffers(aCmdBuff, 0, 3, vBuffers, offsets);
+
+				//Bind Index Buffer
+				vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+				//Draw
+				vkCmdDrawIndexed(aCmdBuff, sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].indexCount, 1, 0, 0, 0);
+			}
+		}
+
+		// Bind Alphamask pipeline 
+		vkCmdBindPipeline(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aAlphamaskPipe);
+		vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aAlphamaskPipeLayout,
+			0, 1, &aSceneDescriptors, 0, nullptr);
+
+		for (auto& mat : aMaterialMeshesMap[1])
+		{
+			// Bind Material descriptors
+			vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aAlphamaskPipeLayout,
+				1, 1, &aTexDescriptors[mat.first], 0, nullptr);
+
+			for (unsigned int i = 0; i < aMaterialMeshesMap[1][mat.first].size(); i++)
+			{
+				// Bind vertex input 
+				VkBuffer vBuffers[3] = { sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].positions.buffer,
+										sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].normals.buffer,
+										sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].texcoords.buffer };
+				VkDeviceSize offsets[3]{};
+				vkCmdBindVertexBuffers(aCmdBuff, 0, 3, vBuffers, offsets);
+
+				//Bind Index Buffer
+				vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+				//Draw
+				vkCmdDrawIndexed(aCmdBuff, sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].indexCount, 1, 0, 0, 0);
+			}
+		}
+
+
+		//For each mesh, Bind buffers and draw
+		//for (unsigned int i = 0; i < sceneMeshes.size(); i++)
+		//{
+		//	vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aPipeLayout,
+		//		1, 1, &aTexDescriptors[
+		//				aModel->materials[
+		//				aModel->meshes[i].materialId
+		//			].baseColorTextureId
+		//		], 0, nullptr);
+
+		////	// Bind vertex input 
+		//	VkBuffer vBuffers[3] = { sceneMeshes[i].positions.buffer, 
+		//							sceneMeshes[i].normals.buffer, 
+		//							sceneMeshes[i].texcoords.buffer };
+		//	VkDeviceSize offsets[3]{};
+		//	vkCmdBindVertexBuffers(aCmdBuff, 0, 3, vBuffers, offsets);
+
+		////	//Bind Index Buffer
+		//	vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[i].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+		//	
+		//	//Draw
+		//	vkCmdDrawIndexed(aCmdBuff, sceneMeshes[i].indexCount, 1, 0, 0, 0);
+
+		//}
+
+		// End the render pass 
+		vkCmdEndRenderPass(aCmdBuff);
+
+
+		// End command recording 
+		if (auto const res = vkEndCommandBuffer(aCmdBuff); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to end recording command buffer\n"
+				"vkEndCommandBuffer() returned %s", lut::to_string(res).c_str());
+		}
+
+
+		//////////////////////////////////////////////////////////////////////////////
+		//wait for command buffer to be available
+		if (auto const res = vkWaitForFences(aWindow.device, 1, &aFence,
+			VK_TRUE, UINT64_MAX); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to wait for shadow command buffer fence \n"
+				"vkWaitForFences() returned %s",  lut::to_string(res).c_str());
+		}
+
+		if (auto const res = vkResetFences(aWindow.device, 1, &aFence); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to reset shadow command buffer fence %u\n"
+				"vkResetFences() returned %s", lut::to_string(res).c_str());
+		}
+		//SUBMIT
+
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &aCmdBuff;
+
+		
+
+		if (auto const res = vkQueueSubmit(aWindow.graphicsQueue, 1, &submitInfo, aFence); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to submit command buffer to queue\n"
+				"vkQueueSubmit() returned %s", lut::to_string(res).c_str());
+		}
+	}
+
+	void create_shadowpass_framebuffers(lut::VulkanWindow const& aWindow, VkRenderPass aRenderPass,
+		lut::Framebuffer& aFramebuffers, VkImageView aDepthView)
+	{
+
+		//throw lut::Error("Not yet implemented"); //TODO: implement me!
+
+		VkFramebufferCreateInfo fbInfo{};
+		fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		fbInfo.flags = 0; // normal framebuffer 
+		fbInfo.renderPass = aRenderPass;
+		fbInfo.attachmentCount = 1;
+		fbInfo.pAttachments = &aDepthView;
+		fbInfo.width = cfg::kShadowMapWidth;
+		fbInfo.height = cfg::kShadowMapHeight;
+		fbInfo.layers = 1;
+
+		VkFramebuffer fb = VK_NULL_HANDLE;
+
+		if (auto const res = vkCreateFramebuffer(aWindow.device, &fbInfo, nullptr, &fb); VK_SUCCESS != res)
+		{
+			throw lut::Error("Unable to create framebuffer for shadowmap\n"
+				"vkCreateFramebuffer() returned %s", lut::to_string(res).c_str());
+		}
+		aFramebuffers = lut::Framebuffer(aWindow.device, fb);
+	}
+}
 
 //EOF vim:syntax=cpp:foldmethod=marker:ts=4:noexpandtab: 
