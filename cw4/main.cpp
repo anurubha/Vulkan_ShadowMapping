@@ -68,8 +68,8 @@ namespace
 		constexpr float kCameraFar = 100.f;
 		constexpr auto kCameraFov = 60.0_degf;
 
-		constexpr float kShadowMapHeight = 1024;
-		constexpr float kShadowMapWidth = 1024;
+		constexpr unsigned int kShadowMapHeight = 1024;
+		constexpr unsigned int kShadowMapWidth = 1024;
 
 		constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 
@@ -88,7 +88,10 @@ namespace
 	// Local types/structures:
 	namespace glsl
 	{
-		//glm::vec3 LightPosition ;
+		struct ShadowPassUniform
+		{ 
+			glm::mat4 lightMVP;
+		};
 
 		struct SceneUniform
 		{ // Note: need to be careful about the packing/alignment here! 
@@ -127,6 +130,7 @@ namespace
 		glm::mat4 camera2world = glm::identity<glm::mat4>();
 
 		glm::vec3 lightPos{ 0.0f, 2.0f, 0.0f };
+		bool changedLightPos;
 	};
 	// Local functions:
 	lut::RenderPass create_render_pass(lut::VulkanWindow const&);
@@ -174,6 +178,10 @@ namespace
 	std::tuple<lut::Image, lut::ImageView> create_shadow_buffer(lut::VulkanWindow const& aWindow, lut::Allocator const& aAllocator);
 	void create_shadowpass_framebuffers(lut::VulkanWindow const& aWindow, VkRenderPass aRenderPass,
 		lut::Framebuffer& aFramebuffers, VkImageView aDepthView);
+	void update_shadowpass_uniforms(glsl::ShadowPassUniform&, glm::vec3 const& aLightPosition);
+	void record_and_submit_shadow_commands(VkCommandBuffer aCmdBuff, VkRenderPass aRenderPass, VkFramebuffer aFramebuffer, VkPipelineLayout aPipeLayout, VkPipeline aPipe,
+		std::vector<SceneMesh> const& sceneMeshes, VkBuffer aSceneUBO, glsl::ShadowPassUniform const& aSceneUniform, VkDescriptorSet aSceneDescriptors,
+		BakedModel* aModel, lut::VulkanContext const& aWindow, VkFence aFence);
 }
 
 int main() try
@@ -199,9 +207,9 @@ int main() try
 	lut::RenderPass shadowPass = create_shadowmap_render_pass(window);
 
 	//create scene descriptor set layout
-	lut::DescriptorSetLayout shadowDesLayout = create_shadowScene_descriptor_layout(window);
+	lut::DescriptorSetLayout spDesLayout = create_shadowScene_descriptor_layout(window);
 
-	lut::PipelineLayout shadowPipeLayout = create_pipeline_layout(window, std::vector< VkDescriptorSetLayout> {shadowDesLayout.handle});
+	lut::PipelineLayout shadowPipeLayout = create_pipeline_layout(window, std::vector< VkDescriptorSetLayout> {spDesLayout.handle});
 	lut::Pipeline shadowPipe = create_shadow_pipeline(window, shadowPass.handle, shadowPipeLayout.handle, cfg::shadowShaderPath);
 
 	auto [shadowMapImage, shadowMapView] = create_shadow_buffer(window, allocator);
@@ -212,9 +220,39 @@ int main() try
 	lut::CommandPool cpool = lut::create_command_pool(window, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
 
 	VkCommandBuffer scbuffer = lut::alloc_command_buffer(window, cpool.handle);
-	lut::Fence shadowPassFence = lut::create_fence(window, VK_FENCE_CREATE_SIGNALED_BIT);
+	lut::Fence shadowPassFence = lut::create_fence(window, VK_FENCE_CREATE_SIGNALED_BIT); // to put b/n Shadow and Lighting Pass
+	lut::Fence scbFence = lut::create_fence(window, VK_FENCE_CREATE_SIGNALED_BIT);// to wait for command buffer to be available
 
 
+	lut::Buffer spUBO = lut::create_buffer(
+		allocator,
+		sizeof(glsl::ShadowPassUniform),
+		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VMA_MEMORY_USAGE_GPU_ONLY
+	);
+
+	//create descriptor pool
+	lut::DescriptorPool sdpool = lut::create_descriptor_pool(window);
+	// allocate descriptor set for uniform buffer
+	VkDescriptorSet spDescriptors = lut::alloc_desc_set(window, sdpool.handle, spDesLayout.handle);
+	//initialize descriptor set with vkUpdateDescriptorSets
+	{
+		VkWriteDescriptorSet desc[1]{};
+
+		VkDescriptorBufferInfo sceneUboInfo{};
+		sceneUboInfo.buffer = spUBO.buffer;
+		sceneUboInfo.range = VK_WHOLE_SIZE;
+
+		desc[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		desc[0].dstSet = spDescriptors;
+		desc[0].dstBinding = 0;
+		desc[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		desc[0].descriptorCount = 1;
+		desc[0].pBufferInfo = &sceneUboInfo;
+
+		constexpr auto numSets = sizeof(desc) / sizeof(desc[0]);
+		vkUpdateDescriptorSets(window.device, numSets, desc, 0, nullptr);
+	}
 	//lut::Semaphore imageAvailable = lut::create_semaphore(window);
 	//lut::Semaphore renderFinished = lut::create_semaphore(window);
 
@@ -283,7 +321,6 @@ int main() try
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 		VMA_MEMORY_USAGE_GPU_ONLY
 	);
-
 
 	//create descriptor pool
 	lut::DescriptorPool dpool = lut::create_descriptor_pool(window);
@@ -519,11 +556,80 @@ int main() try
 	// Application main loop
 	bool recreateSwapchain = false;
 	auto previousClock = Clock_::now();
+	state.changedLightPos = true;
 
 	while (!glfwWindowShouldClose(window.window))
 	{
 		glfwPollEvents(); // or: glfwWaitEvents()
+		
 
+		// Update state 
+		auto const now = Clock_::now();
+		auto const dt = std::chrono::duration_cast<Secondsf_>(now - previousClock).count();
+		previousClock = now;
+
+		update_user_state(state, dt);
+
+		//Update uniforms
+		glsl::ShadowPassUniform spUniforms{};
+		update_shadowpass_uniforms(spUniforms, state.lightPos);
+
+		//SHADOW PASS
+		// Since scene is stationary, run shadow pass only if light position changes
+		// Otherwise reuse old shadow map for lighting pass
+		if (state.changedLightPos)
+		{
+			//wait for command buffer to be available
+			if (auto const res = vkWaitForFences(window.device, 1, &scbFence.handle,
+				VK_TRUE, std::numeric_limits<std::uint64_t>::max()); VK_SUCCESS != res)
+			{
+				throw lut::Error("Unable to wait for command buffer fence %u\n"
+					"vkWaitForFences() returned %s", lut::to_string(res).c_str());
+			}
+
+			if (auto const res = vkResetFences(window.device, 1, &scbFence.handle); VK_SUCCESS != res)
+			{
+				throw lut::Error("Unable to reset command buffer fence %u\n"
+					"vkResetFences() returned %s", lut::to_string(res).c_str());
+			}
+
+			//Record and submit commands
+			record_and_submit_shadow_commands(
+				scbuffer,
+				shadowPass.handle,
+				shadowBuffer.handle,
+				shadowPipeLayout.handle,
+				shadowPipe.handle,
+				sceneMeshes,
+				spUBO.buffer,
+				spUniforms,
+				spDescriptors,
+				&bakedModel,
+				window,
+				scbFence.handle
+			);
+
+
+
+			// Wait for shadow pass completion before starting lighting pass
+			if (auto const res = vkWaitForFences(window.device, 1, &shadowPassFence.handle,
+				VK_TRUE, UINT64_MAX); VK_SUCCESS != res)
+			{
+				throw lut::Error("Unable to wait for shadow pass completion fence %u\n"
+					"vkWaitForFences() returned %s", lut::to_string(res).c_str());
+			}
+			
+			if (auto const res = vkResetFences(window.device, 1, &shadowPassFence.handle); VK_SUCCESS != res)
+			{
+				throw lut::Error("Unable to reset shadow pass completion fence %u\n"
+					"vkResetFences() returned %s", lut::to_string(res).c_str());
+			}
+
+			state.changedLightPos = false;
+		}
+
+		
+		//LIGHT PASS
 		// Recreate swap chain?
 		if (recreateSwapchain)
 		{
@@ -549,7 +655,6 @@ int main() try
 				defaultPipe = create_pipeline(window, renderPass.handle, defaultPipeLayout.handle, cfg::defaultShaderPath);
 				alphamaskPipe = create_pipeline(window, renderPass.handle, alphamaskPipeLayout.handle, cfg::alphamaskShaderPath);
 			}
-
 
 			recreateSwapchain = false;
 			continue;
@@ -595,11 +700,11 @@ int main() try
 		}
 
 		// Update state 
-		auto const now = Clock_::now();
-		auto const dt = std::chrono::duration_cast<Secondsf_>(now - previousClock).count();
-		previousClock = now;
+		//auto const now = Clock_::now();
+		//auto const dt = std::chrono::duration_cast<Secondsf_>(now - previousClock).count();
+		//previousClock = now;
 
-		update_user_state(state, dt);
+		//update_user_state(state, dt);
 
 		//Update uniforms
 		glsl::SceneUniform sceneUniforms{};
@@ -1418,6 +1523,7 @@ namespace
 		{
 			glm::mat4 lightRotationMatrix = glm::rotate(glm::mat4(1.0f), glm::radians(45.0f), glm::vec3(0.0f, 1.0f, 0.0f));
 			aState.lightPos = glm::vec3(lightRotationMatrix * glm::vec4(aState.lightPos, 1.0f));
+			aState.changedLightPos = true;
 		}
 	}
 
@@ -1695,13 +1801,9 @@ namespace
 	}
 
 
-	void record_and_submit_shadow_commands(VkCommandBuffer aCmdBuff, VkRenderPass aRenderPass, VkFramebuffer aFramebuffer, VkPipelineLayout aDefaultPipeLayout,
-		VkPipeline aDefaultPipe, VkPipelineLayout aAlphamaskPipeLayout, VkPipeline aAlphamaskPipe, VkExtent2D const& aImageExtent,
-		std::vector<SceneMesh> const& sceneMeshes, VkBuffer aSceneUBO,
-		glsl::SceneUniform const& aSceneUniform, VkDescriptorSet aSceneDescriptors,
-		std::vector <VkDescriptorSet> aTexDescriptors, BakedModel* aModel, std::unordered_map <unsigned int, std::unordered_map <unsigned int, std::vector<unsigned int>>> aMaterialMeshesMap
-	, lut::VulkanContext const& aWindow,
-		VkFence aFence)
+	void record_and_submit_shadow_commands(VkCommandBuffer aCmdBuff, VkRenderPass aRenderPass, VkFramebuffer aFramebuffer, VkPipelineLayout aPipeLayout, VkPipeline aPipe, 
+		std::vector<SceneMesh> const& sceneMeshes, VkBuffer aSceneUBO, glsl::ShadowPassUniform const& aSceneUniform, VkDescriptorSet aSceneDescriptors,
+		BakedModel* aModel, lut::VulkanContext const& aWindow, VkFence aFence)
 	{
 		//throw lut::Error("Not yet implemented"); //TODO: implement me!
 		// Begin recording commands 
@@ -1725,7 +1827,8 @@ namespace
 			VK_PIPELINE_STAGE_TRANSFER_BIT
 		);
 
-		vkCmdUpdateBuffer(aCmdBuff, aSceneUBO, 0, sizeof(glsl::SceneUniform), &aSceneUniform);
+		vkCmdUpdateBuffer(aCmdBuff, aSceneUBO, 0, sizeof(glsl::ShadowPassUniform), &aSceneUniform);
+
 		lut::buffer_barrier(aCmdBuff,
 			aSceneUBO,
 			VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1744,7 +1847,7 @@ namespace
 		passInfo.renderPass = aRenderPass;
 		passInfo.framebuffer = aFramebuffer;
 		passInfo.renderArea.offset = VkOffset2D{ 0, 0 };
-		passInfo.renderArea.extent = VkExtent2D{ aImageExtent.width, aImageExtent.height };
+		passInfo.renderArea.extent = VkExtent2D{ cfg::kShadowMapWidth, cfg::kShadowMapHeight };
 		passInfo.clearValueCount = 1;
 		passInfo.pClearValues = clearValues;
 
@@ -1753,86 +1856,26 @@ namespace
 
 		// Begin drawing with graphics pipeline 
 		// Bind Default pipeline 
-		vkCmdBindPipeline(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aDefaultPipe);
-		vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aDefaultPipeLayout,
+		vkCmdBindPipeline(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aPipe);
+
+		// Bind Scene descriptor set
+		vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aPipeLayout,
 			0, 1, &aSceneDescriptors, 0, nullptr);
-
-		for (auto& mat : aMaterialMeshesMap[0])
-		{
-			// Bind Material descriptors
-			vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aDefaultPipeLayout,
-				1, 1, &aTexDescriptors[mat.first], 0, nullptr);
-
-			for (unsigned int i = 0; i < aMaterialMeshesMap[0][mat.first].size(); i++)
-			{
-				// Bind vertex input 
-				VkBuffer vBuffers[3] = { sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].positions.buffer,
-										sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].normals.buffer,
-										sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].texcoords.buffer };
-				VkDeviceSize offsets[3]{};
-				vkCmdBindVertexBuffers(aCmdBuff, 0, 3, vBuffers, offsets);
-
-				//Bind Index Buffer
-				vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-				//Draw
-				vkCmdDrawIndexed(aCmdBuff, sceneMeshes[aMaterialMeshesMap[0][mat.first][i]].indexCount, 1, 0, 0, 0);
-			}
-		}
-
-		// Bind Alphamask pipeline 
-		vkCmdBindPipeline(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aAlphamaskPipe);
-		vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aAlphamaskPipeLayout,
-			0, 1, &aSceneDescriptors, 0, nullptr);
-
-		for (auto& mat : aMaterialMeshesMap[1])
-		{
-			// Bind Material descriptors
-			vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aAlphamaskPipeLayout,
-				1, 1, &aTexDescriptors[mat.first], 0, nullptr);
-
-			for (unsigned int i = 0; i < aMaterialMeshesMap[1][mat.first].size(); i++)
-			{
-				// Bind vertex input 
-				VkBuffer vBuffers[3] = { sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].positions.buffer,
-										sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].normals.buffer,
-										sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].texcoords.buffer };
-				VkDeviceSize offsets[3]{};
-				vkCmdBindVertexBuffers(aCmdBuff, 0, 3, vBuffers, offsets);
-
-				//Bind Index Buffer
-				vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-				//Draw
-				vkCmdDrawIndexed(aCmdBuff, sceneMeshes[aMaterialMeshesMap[1][mat.first][i]].indexCount, 1, 0, 0, 0);
-			}
-		}
-
 
 		//For each mesh, Bind buffers and draw
-		//for (unsigned int i = 0; i < sceneMeshes.size(); i++)
-		//{
-		//	vkCmdBindDescriptorSets(aCmdBuff, VK_PIPELINE_BIND_POINT_GRAPHICS, aPipeLayout,
-		//		1, 1, &aTexDescriptors[
-		//				aModel->materials[
-		//				aModel->meshes[i].materialId
-		//			].baseColorTextureId
-		//		], 0, nullptr);
+		for (unsigned int i = 0; i < sceneMeshes.size(); i++)
+		{
+			// Bind vertex input 
+			VkBuffer vBuffers[1] = { sceneMeshes[i].positions.buffer};
+			VkDeviceSize offsets[1]{};
+			vkCmdBindVertexBuffers(aCmdBuff, 0, 1, vBuffers, offsets);
 
-		////	// Bind vertex input 
-		//	VkBuffer vBuffers[3] = { sceneMeshes[i].positions.buffer, 
-		//							sceneMeshes[i].normals.buffer, 
-		//							sceneMeshes[i].texcoords.buffer };
-		//	VkDeviceSize offsets[3]{};
-		//	vkCmdBindVertexBuffers(aCmdBuff, 0, 3, vBuffers, offsets);
-
-		////	//Bind Index Buffer
-		//	vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[i].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-		//	
-		//	//Draw
-		//	vkCmdDrawIndexed(aCmdBuff, sceneMeshes[i].indexCount, 1, 0, 0, 0);
-
-		//}
+			//Bind Index Buffer
+			vkCmdBindIndexBuffer(aCmdBuff, sceneMeshes[i].indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+			
+			//Draw
+			vkCmdDrawIndexed(aCmdBuff, sceneMeshes[i].indexCount, 1, 0, 0, 0);
+		}
 
 		// End the render pass 
 		vkCmdEndRenderPass(aCmdBuff);
@@ -1844,36 +1887,19 @@ namespace
 			throw lut::Error("Unable to end recording command buffer\n"
 				"vkEndCommandBuffer() returned %s", lut::to_string(res).c_str());
 		}
-
-
-		//////////////////////////////////////////////////////////////////////////////
-		//wait for command buffer to be available
-		if (auto const res = vkWaitForFences(aWindow.device, 1, &aFence,
-			VK_TRUE, UINT64_MAX); VK_SUCCESS != res)
-		{
-			throw lut::Error("Unable to wait for shadow command buffer fence \n"
-				"vkWaitForFences() returned %s",  lut::to_string(res).c_str());
-		}
-
-		if (auto const res = vkResetFences(aWindow.device, 1, &aFence); VK_SUCCESS != res)
-		{
-			throw lut::Error("Unable to reset shadow command buffer fence %u\n"
-				"vkResetFences() returned %s", lut::to_string(res).c_str());
-		}
+		
 		//SUBMIT
-
 		VkSubmitInfo submitInfo{};
 		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 		submitInfo.commandBufferCount = 1;
 		submitInfo.pCommandBuffers = &aCmdBuff;
-
-		
 
 		if (auto const res = vkQueueSubmit(aWindow.graphicsQueue, 1, &submitInfo, aFence); VK_SUCCESS != res)
 		{
 			throw lut::Error("Unable to submit command buffer to queue\n"
 				"vkQueueSubmit() returned %s", lut::to_string(res).c_str());
 		}
+
 	}
 
 	void create_shadowpass_framebuffers(lut::VulkanWindow const& aWindow, VkRenderPass aRenderPass,
@@ -1900,6 +1926,16 @@ namespace
 				"vkCreateFramebuffer() returned %s", lut::to_string(res).c_str());
 		}
 		aFramebuffers = lut::Framebuffer(aWindow.device, fb);
+	}
+
+	void update_shadowpass_uniforms(glsl::ShadowPassUniform& aShadowUniforms, glm::vec3 const& aLightPosition)
+	{
+		// Matrix from light's point of view
+		glm::mat4 P = glm::perspectiveRH_ZO(lut::Radians(cfg::kCameraFov).value(), 1.0f, cfg::kCameraNear, cfg::kCameraFar);
+		glm::mat4 V = glm::lookAt(aLightPosition, glm::vec3(0.0f), glm::vec3(0, 1, 0));
+		glm::mat4 M = glm::mat4(1.0f);
+
+		aShadowUniforms.lightMVP = P * V * M;
 	}
 }
 

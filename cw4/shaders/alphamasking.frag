@@ -28,7 +28,7 @@ void main()
 { 
 
 	highp float mask = texture( AlphaMaskSampler, gTexCoord ).r;
-	if(texture( BaseColorSampler, gTexCoord ).a < mask)
+	if(texture( BaseColorSampler, gTexCoord ).a == mask)
         discard;
 
 	// reading and converting from [0, 1] to [-1, 1]
