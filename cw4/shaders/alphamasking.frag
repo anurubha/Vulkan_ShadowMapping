@@ -3,12 +3,14 @@
 layout (location = 0) in vec3 gPosition; //in world space
 layout (location = 1) in vec3 gNormal;
 layout (location = 2) in vec2 gTexCoord; 
+layout (location = 3) in vec4 ShadowCoord; 
 
 layout( set = 0, binding = 0 ) uniform UScene 
 	{ 
 		mat4 camera; 
 		mat4 projection; 
 		mat4 projCam; 
+		mat4 lightMVP;
 
 		vec3 cameraPosition;
 		vec3 lightPosition;
@@ -16,6 +18,7 @@ layout( set = 0, binding = 0 ) uniform UScene
 		vec3 ambientColor;
 	} uScene; 
 
+layout( set = 0, binding = 1 ) uniform sampler2DShadow ShadowMapSampler;
 
 layout( set = 1, binding = 0 ) uniform sampler2D BaseColorSampler;
 layout( set = 1, binding = 1 ) uniform sampler2D RoughnessSampler; 
@@ -25,20 +28,29 @@ layout( set = 1, binding = 3 ) uniform sampler2D AlphaMaskSampler;
 layout( location = 0 ) out vec4 oColor; 
 
 void main() 
-{ 
-
-	highp float mask = texture( AlphaMaskSampler, gTexCoord ).r;
+{ 	
+	float mask = texture( AlphaMaskSampler, gTexCoord ).r;
 	if(texture( BaseColorSampler, gTexCoord ).a == mask)
         discard;
 
-	// reading and converting from [0, 1] to [-1, 1]
-	//vec3 mapNormal = normalize(2 * texture( NormalMapSampler, gTexCoord ).rgb - 1.0);
-	//vec3 vNormal = normalize(gNormal);
-	//vec4 tangent = normalize(gtangent);
-	//vec3 bitangent = normalize(cross(vNormal, tangent.xyz) * tangent.w);
-
-	//vec3 normal = normalize( mat3( tangent.xyz, bitangent, vNormal) * mapNormal); 
 	
+	// PCF
+	float xOffset = 1.0/2048;
+    float yOffset = 1.0/2048;
+
+	float visibility = 0.0;
+
+	for (int y = -5 ; y <= 5 ; y++) {
+        for (int x = -5 ; x <= 5 ; x++) {
+            vec2 Offsets = vec2(x * xOffset, y * yOffset);
+            visibility += textureProj(ShadowMapSampler, vec4(ShadowCoord.xy+Offsets, ShadowCoord.zw));
+        }
+    }
+
+	visibility = visibility / 121.0;
+	
+	visibility = textureProj(ShadowMapSampler, ShadowCoord);
+
 	vec3 lightDirection = normalize(uScene.lightPosition - gPosition); 
 	vec3 viewDirection = normalize(uScene.cameraPosition - gPosition);	
 	vec3 halfVector = normalize(viewDirection + lightDirection);
@@ -72,9 +84,9 @@ void main()
 	float G = min (1, min((2 * NoH * NoV / VoH) , (2 * NoH * NoL / VoH)));
 
 	// microfacet BRDF model
-	vec3 Fr = LDiffuse + (D * F * G )/ max((4 * NoV * NoL), 0.0001); 
+	vec3 Fr = (LDiffuse + (D * F * G )/ max((4 * NoV * NoL), 0.0001)) * visibility; 	
 
 	oColor = vec4(AmbientLight + Fr * uScene.lightColor * NoL , 1.0f);
-	
+	//oColor = vec4(visibility,0,0,1);
 } 
 

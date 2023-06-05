@@ -9,6 +9,7 @@ layout( set = 0, binding = 0 ) uniform UScene
 		mat4 camera; 
 		mat4 projection; 
 		mat4 projCam; 
+		mat4 lightMVP;
 
 		vec3 cameraPosition;
 		vec3 lightPosition;
@@ -19,6 +20,7 @@ layout( set = 0, binding = 0 ) uniform UScene
 layout (location = 0) out vec3 gPosition;
 layout (location = 1) out vec3 gNormal; 
 layout (location = 2) out vec2 gTexCoord; 
+layout (location = 3) out vec4 ShadowCoord; 
 
 void main() 
 { 
@@ -26,5 +28,6 @@ void main()
 	gNormal = normalize(normal);
 	gTexCoord = texcoord;
 
-	gl_Position = uScene.projCam * vec4( position, 1.f ); 
+	gl_Position = uScene.projCam * vec4( position, 1.f );
+	ShadowCoord = uScene.lightMVP * vec4( position, 1.f );
 } 

@@ -3,12 +3,14 @@
 layout (location = 0) in vec3 gPosition; //in world space
 layout (location = 1) in vec3 gNormal;
 layout (location = 2) in vec2 gTexCoord;
+layout (location = 3) in vec4 ShadowCoord; 
 
 layout( set = 0, binding = 0 ) uniform UScene 
 	{ 
 		mat4 camera; 
 		mat4 projection; 
 		mat4 projCam; 
+		mat4 lightMVP;
 
 		vec3 cameraPosition;
 		vec3 lightPosition;
@@ -16,6 +18,7 @@ layout( set = 0, binding = 0 ) uniform UScene
 		vec3 ambientColor;
 	} uScene; 
 
+layout( set = 0, binding = 1 ) uniform sampler2DShadow ShadowMapSampler;
 
 layout( set = 1, binding = 0 ) uniform sampler2D BaseColorSampler;
 layout( set = 1, binding = 1 ) uniform sampler2D RoughnessSampler; 
@@ -26,6 +29,12 @@ layout( location = 0 ) out vec4 oColor;
 
 void main() 
 { 
+	float bias = 0.005 ;
+	float visibility = 1.0;
+
+	if (textureProj(ShadowMapSampler, ShadowCoord.xyzw)  <  (ShadowCoord.z-bias)/ShadowCoord.w)
+		visibility = 0.5;
+	
 
 	// reading and converting from [0, 1] to [-1, 1]
 	//vec3 mapNormal = normalize(2 * texture( NormalMapSampler, gTexCoord ).rgb - 1.0);
@@ -68,8 +77,11 @@ void main()
 	float G = min (1, min((2 * NoH * NoV / VoH) , (2 * NoH * NoL / VoH)));
 
 	// microfacet BRDF model
-	vec3 Fr = LDiffuse + (D * F * G )/ max((4 * NoV * NoL), 0.0001); 
+	vec3 Fr = LDiffuse + (D * F * G )/ max((4 * NoV * NoL), 0.0001) * visibility; 
 
+	
 	oColor = vec4(AmbientLight + Fr * uScene.lightColor * NoL , 1.0f);
 	
+	if(visibility == 0.5)
+		oColor = vec4(0,0,0,1);
 } 
